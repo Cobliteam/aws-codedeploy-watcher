@@ -43,7 +43,9 @@ def main():
     watcher = DeploymentWatcher(
         session, d_id, log_group_names, out_file=sys.stderr)
 
-    watcher.update()
+    while not watcher.update():
+        time.sleep(2)
+
     if watcher.is_finished():
         logger.info(
             'Deployment {} is already finished, displaying past logs'.format(

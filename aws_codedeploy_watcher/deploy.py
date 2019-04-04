@@ -1,10 +1,14 @@
 from __future__ import print_function
 
+import logging
 import sys
 
 import pendulum
 
 from .logs import LogWatcher
+
+
+logger = logging.getLogger(__name__)
 
 
 class DeploymentWatcher(object):
@@ -44,12 +48,17 @@ class DeploymentWatcher(object):
                     for target_id in response['targetIds']:
                         yield target_id
 
-            self._target_ids = list(_get_target_ids())
+            try:
+                self._target_ids = list(_get_target_ids())
+            except self._client.exceptions.DeploymentNotStartedException:
+                return None
 
         return self._target_ids
 
     def get_targets(self, types):
         target_ids = self.get_target_ids()
+        if target_ids is None:
+            return None
 
         response = self._client.batch_get_deployment_targets(
             deploymentId=self.deployment_id, targetIds=target_ids)
@@ -116,8 +125,15 @@ class DeploymentWatcher(object):
         if not self._complete_time and self.is_finished():
             self._complete_time = \
                 pendulum.instance(self._deploy_info['completeTime'])
+
         self._targets = dict(
             self.get_targets(types=('InstanceTarget', 'ECSTarget')))
+        if self._targets is None:
+            logger.info('Deployment {} has no targets yet, waiting'.format(
+                self.deployment_id))
+            return False
+
+        return True
 
     def display(self):
         assert self.is_finished()

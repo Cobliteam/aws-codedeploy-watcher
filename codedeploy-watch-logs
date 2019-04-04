@@ -1,0 +1,185 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+
+import re
+import sys
+import time
+from datetime import datetime
+
+import boto3
+import botocore.exceptions
+
+cd = boto3.client('codedeploy')
+logs = boto3.client('logs')
+
+list_deployment_targets = cd.get_paginator('list_deployment_targets').paginate
+describe_log_groups = logs.get_paginator('describe_log_groups').paginate
+filter_log_events = logs.get_paginator('filter_log_events').paginate
+
+
+def find_log_groups(prefix, pattern):
+    compiled_pat = re.compile(pattern)
+
+    for groups in describe_log_groups(logGroupNamePrefix=prefix):
+        for group in groups['logGroups']:
+            group_name = group['logGroupName']
+            assert group_name.startswith(prefix)
+
+            group_suffix = group_name[len(prefix):]
+            if compiled_pat.search(group_suffix):
+                yield group_name
+
+
+class LogWatcher(object):
+    def __init__(self, out_file=sys.stderr):
+        self._log_streams = {}
+        self._group_timestamps = {}
+        self._out_file = out_file
+
+    def add_log_stream(self, group_name, stream_name):
+        stream_names = self._log_streams.setdefault(group_name, set())
+        stream_names.add(stream_name)
+
+        self._group_timestamps.setdefault(group_name, int(time.time()))
+
+    def remove_log_stream(self, group_name, stream_name):
+        stream_names = self._log_streams.setdefault(group_name, set())
+        stream_names.discard(stream_name)
+
+    def refresh(self):
+        for group_name, stream_names in self._log_streams.items():
+            if not stream_names:
+                continue
+
+            last_ts = self._group_timestamps.get(group_name, 0)
+            try:
+                event_batches = filter_log_events(
+                    logGroupName=group_name,
+                    logStreamNames=list(stream_names),
+                    startTime=last_ts)
+
+                for batch in event_batches:
+                    for event in batch['events']:
+                        self.print_event(event)
+                        last_ts = \
+                            max(last_ts, event['ingestionTime'])
+            except botocore.exceptions.ClientError as e:
+                if e.response['Error']['Code'] != '404':
+                    raise
+
+            self._group_timestamps[group_name] = last_ts
+
+    def print_event(self, event):
+        ts = event['ingestionTime'] / 1000
+        date_str = datetime.utcfromtimestamp(ts).isoformat()
+        print('{}: {} - {}'.format(event['logStreamName'], date_str,
+              event['message'], file=self._out_file))
+
+
+class DeploymentWatcher(object):
+    def __init__(self, deployment_id, log_group_names, out_file=sys.stderr):
+        self.deployment_id = deployment_id
+        self.status = None
+        self.log_group_names = log_group_names
+
+        self._targets = None
+        self._target_lifecycle_events = {}
+        self._log_watcher = LogWatcher(out_file=out_file)
+        self._out_file = out_file
+
+    def is_finished(self):
+        return self.status in ('Succeeded', 'Failed')
+
+    def is_target_active(self, target):
+        return target['status'] == 'InProgress'
+
+    def is_target_finished(self, target):
+        return target['status'] in ('Succeeded', 'Failed', 'Skipped', 'Ready')
+
+    def get_targets(self):
+        if self._targets is not None:
+            return self._targets
+
+        target_ids = [
+            tid
+            for res in list_deployment_targets(deploymentId=deployment_id)
+            for tid in res['targetIds']
+        ]
+        targets = cd.batch_get_deployment_targets(
+            deploymentId=deployment_id, targetIds=target_ids)
+        self._targets = targets['deploymentTargets']
+        return self._targets
+
+    def refresh(self):
+        deploy_info = \
+            cd.get_deployment(deploymentId=deployment_id)['deploymentInfo']
+
+        self.status = deploy_info['status']
+
+        for target in self.get_targets():
+            target_type = target['deploymentTargetType']
+            if target_type == 'InstanceTarget':
+                target_info = target['instanceTarget']
+            elif target_type == 'ECSTarget':
+                target_info = target['ecsTarget']
+            else:
+                continue
+
+            target_id = target_info['targetId']
+            events = self._target_lifecycle_events.setdefault(target_id, {})
+
+            for event in target_info['lifecycleEvents']:
+                event_name = event['lifecycleEventName']
+                prev_event = events.get(event_name)
+                if not prev_event or event != prev_event:
+                    self.print_lifecycle_event(target_id, event)
+
+                events[event_name] = event
+
+            if self.is_target_active(target_info):
+                for group_name in self.log_group_names:
+                    self._log_watcher.add_log_stream(
+                        group_name, target_info['targetId'])
+            elif self.is_target_finished(target_info):
+                for group_name in self.log_group_names:
+                    self._log_watcher.remove_log_stream(
+                        group_name, target_info['targetId'])
+
+        self._log_watcher.refresh()
+
+    def print_lifecycle_event(self, target_id, event):
+        start_time = event.get('startTime')
+        end_time = event.get('endTime')
+
+        if start_time is None and end_time is None:
+            display_time = '?'
+        elif not end_time:
+            display_time = start_time.isoformat()
+        else:
+            display_time = end_time.isoformat()
+
+        message = event.get('diagnostics', {}).get('message', '')
+        print('{} ({}): {} - {} {} {}'.format(
+            self.deployment_id, target_id, display_time,
+            event['lifecycleEventName'], event['status'], message,
+            file=self._out_file))
+
+
+deployment_id = sys.argv[1]
+log_group_prefix = sys.argv[2]
+log_group_pattern = sys.argv[3]
+log_group_names = list(find_log_groups(log_group_prefix, log_group_pattern))
+
+deployment_watcher = DeploymentWatcher(
+    deployment_id, log_group_names=log_group_names)
+
+deployment_watcher.refresh()
+while not deployment_watcher.is_finished():
+    time.sleep(5)
+
+    deployment_watcher.refresh()
+    print('refreshed')
+
+if deployment_watcher.status != 'Succeeded':
+    sys.exit(1)

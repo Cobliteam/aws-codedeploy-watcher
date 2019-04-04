@@ -111,12 +111,13 @@ class DeploymentWatcher(object):
             self._client.get_deployment(deploymentId=self.deployment_id)
 
         self._deploy_info = response['deploymentInfo']
-        if not self._complete_time:
+        self.status = self._deploy_info['status']
+
+        if not self._complete_time and self.is_finished():
             self._complete_time = \
                 pendulum.instance(self._deploy_info['completeTime'])
         self._targets = dict(
             self.get_targets(types=('InstanceTarget', 'ECSTarget')))
-        self.status = self._deploy_info['status']
 
     def display(self):
         assert self.is_finished()

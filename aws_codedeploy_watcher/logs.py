@@ -42,7 +42,7 @@ class LogWatcher(object):
         stream_names.add(stream_name)
 
         if start_time:
-            start_time = pendulum.datetime(start_time)
+            start_time = pendulum.instance(start_time)
             self._group_timestamps[group_name] = \
                 int(start_time.timestamp * 1000)
 

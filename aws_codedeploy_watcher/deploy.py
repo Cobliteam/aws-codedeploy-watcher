@@ -27,7 +27,7 @@ class DeploymentWatcher(object):
         self._target_lifecycle_events = {}
         self._targets = None
         self._log_watcher = LogWatcher(session, out_file=out_file)
-        self._last_update_time = None
+        self._last_update_time = pendulum.from_timestamp(0)
         self._complete_time = None
 
     def is_finished(self):
@@ -156,7 +156,7 @@ class DeploymentWatcher(object):
         fresh_events = []
 
         for target_id, target in self._targets.items():
-            updated_at = target['lastUpdatedAt']
+            updated_at = pendulum.instance(target['lastUpdatedAt'])
             if updated_at <= self._last_update_time:
                 continue
 

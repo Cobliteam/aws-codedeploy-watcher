@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "aws-codedeploy-watcher"
-version = "0.1.4"
+version = "0.1.5"
 description = "Observe AWS Codedeploy deployments live"
 authors = ["Daniel Miranda <danielkza2@gmail.com>"]
 license = "MIT"

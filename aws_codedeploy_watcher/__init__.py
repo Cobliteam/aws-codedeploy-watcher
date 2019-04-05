@@ -31,6 +31,13 @@ def main():
              'to follow. Use it only for selections that can\'t be done with '
              'just the prefix, as this will require loading all the groups and'
              'filtering locally.')
+    argp.add_argument(
+        '--start-timeout', type=float, metavar='SECONDS', default=60,
+        help='How long to wait for a Pending deployment to start')
+    argp.add_argument(
+        '--stop-on-interrupt', action='store_true',
+        help='Cancel deployment if the program is inter')
+
     args = argp.parse_args()
 
     session = boto3.session.Session()
@@ -43,25 +50,20 @@ def main():
     watcher = DeploymentWatcher(
         session, d_id, log_group_names, out_file=sys.stderr)
 
-    while not watcher.update():
-        time.sleep(2)
-
-    if watcher.is_finished():
-        logger.info(
-            'Deployment {} is already finished, displaying past logs'.format(
-                d_id))
-        watcher.display()
-    else:
-        logger.info(
-            'Deployment {} is in progress, following logs'.format(d_id))
-        while True:
+    watcher.wait_started(args.start_timeout)
+    try:
+        while not watcher.is_finished():
             watcher.follow()
-            if watcher.is_finished():
-                break
+            time.sleep(1)
+    except Exception:
+        if args.stop_on_interrupt:
+            watcher.stop_deployment()
 
-            time.sleep(5)
+        raise
 
-    if watcher.status != 'Succeeded':
+    watcher.display()
+
+    if watcher.failed():
         logger.error(
             'Deployment {} finished with failed status: {}'.format(
                 d_id, watcher.status))

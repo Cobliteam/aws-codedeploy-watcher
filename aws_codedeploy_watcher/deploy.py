@@ -2,6 +2,7 @@ from __future__ import print_function
 
 import logging
 import sys
+import time
 
 import pendulum
 
@@ -23,6 +24,7 @@ class DeploymentWatcher(object):
             self._client.get_paginator('list_deployment_targets').paginate
         self._out_file = out_file
 
+        self._deploy_info = None
         self._target_ids = None
         self._target_lifecycle_events = {}
         self._targets = None
@@ -30,8 +32,14 @@ class DeploymentWatcher(object):
         self._last_update_time = pendulum.from_timestamp(0)
         self._complete_time = None
 
+    def is_started(self):
+        return self.status != 'Pending'
+
     def is_finished(self):
         return self.status in ('Succeeded', 'Failed')
+
+    def failed(self):
+        return self.status == 'Failed'
 
     def is_target_active(self, target):
         return target['status'] == 'InProgress'
@@ -58,7 +66,7 @@ class DeploymentWatcher(object):
     def get_targets(self, types):
         target_ids = self.get_target_ids()
         if target_ids is None:
-            return None
+            return
 
         response = self._client.batch_get_deployment_targets(
             deploymentId=self.deployment_id, targetIds=target_ids)
@@ -115,6 +123,20 @@ class DeploymentWatcher(object):
 
                 target_events[event_name] = event
 
+    def wait_started(self, sleep=time.sleep, timeout=None):
+        if self.is_started():
+            return
+
+        logger.info('Deployment {} is pending, waiting for start'.format(self.deployment_id))
+
+        deadline = time.time() + timeout if timeout else float('inf')
+        while not self.update() and time.time() < deadline:
+            sleep(1)
+
+        if not self.is_started():
+            raise RuntimeError(
+                'Deployment {} timed out while starting'.format(self.deployment_id))
+
     def update(self):
         response = \
             self._client.get_deployment(deploymentId=self.deployment_id)
@@ -128,7 +150,7 @@ class DeploymentWatcher(object):
 
         self._targets = dict(
             self.get_targets(types=('InstanceTarget', 'ECSTarget')))
-        if self._targets is None:
+        if not self._targets:
             logger.info('Deployment {} has no targets yet, waiting'.format(
                 self.deployment_id))
             return False
@@ -136,10 +158,12 @@ class DeploymentWatcher(object):
         return True
 
     def display(self):
-        assert self.is_finished()
+        if not self.update():
+            return
 
         create_time = self._deploy_info.get('createTime')
         start_time = self._deploy_info.get('startTime')
+
         self._log_watcher.set_time_range(
             start=start_time or create_time,
             end=self._complete_time)
@@ -150,7 +174,8 @@ class DeploymentWatcher(object):
         self.print_log_messages()
 
     def follow(self):
-        self.update()
+        if not self.update():
+            return
 
         new_update_time = self._last_update_time
         fresh_events = []
@@ -182,22 +207,38 @@ class DeploymentWatcher(object):
             self.print_lifecycle_event(event_time, target_id, event)
 
     def print_lifecycle_event(self, event_time, target_id, event):
-        message = event.get('diagnostics', {}).get('message', '')
-        if message == event['status']:
-            message = ''
-        if message:
-            message = '- ' + message
+        event_message = event.get('diagnostics', {}).get('message', '')
+        if event_message == event['status']:
+            event_message = ''
+        if event_message:
+            event_message = '- ' + event_message
 
-        msg = '{} ({}): [{}] {}: {} {}'.format(
-            self.deployment_id, target_id, event_time.to_datetime_string(),
-            event['lifecycleEventName'], event['status'], message)
+        msg = '{id} ({target_id}): [{time}] {name}: {status} {msg}'.format(
+            id=self.deployment_id,
+            target_id=target_id,
+            time=event_time.to_datetime_string(),
+            name=event['lifecycleEventName'],
+            status=event['status'],
+            msg=event_message)
         print(msg, file=self._out_file)
 
     def print_log_messages(self):
-        events = sorted(self._log_watcher.follow())
+        def sort_key(t):
+            event_time, group_name, _ = t
+            return event_time, group_name
+
+        events = sorted(self._log_watcher.follow(), key=sort_key)
+
         for event_time, group_name, event in events:
             target_id = event['logStreamName']
-            msg = '{} ({}): [{}] {}'.format(
-                self.deployment_id, target_id, event_time.to_datetime_string(),
-                event['message'])
+            msg = '{id} ({target_id}): [{time}] {msg}'.format(
+                id=self.deployment_id,
+                target_id=target_id,
+                time=event_time.to_datetime_string(),
+                msg=event['message'])
             print(msg, file=self._out_file)
+
+    def stop_deployment(self):
+        if self.is_started():
+            self._client.stop_deployment(
+                deploymentId=self.deployment_id, autoRollbackEnabled=True)

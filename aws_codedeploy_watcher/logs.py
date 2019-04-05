@@ -3,8 +3,7 @@ import re
 import sys
 
 import pendulum
-import botocore.exceptions
-
+from botocore.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +25,13 @@ def find_log_groups(session, prefix, pattern):
 
 class LogWatcher(object):
     def __init__(self, session, out_file=sys.stderr):
-        self._client = session.client('logs')
         self._log_streams = {}
         self._group_timestamps = {}
         self._out_file = out_file
 
+        # Ensure we can handle throttling from fetching the logs
+        config = Config(retries=dict(max_attempts=10))
+        self._client = session.client('logs', config=config)
         self._filter_log_events = \
             self._client.get_paginator('filter_log_events').paginate
 
@@ -44,7 +45,7 @@ class LogWatcher(object):
         if start_time:
             start_time = pendulum.instance(start_time)
             self._group_timestamps[group_name] = \
-                int(start_time.timestamp * 1000)
+                int(start_time.float_timestamp * 1000)
 
     def remove_log_stream(self, group_name, stream_name):
         stream_names = self._log_streams.setdefault(group_name, set())
@@ -75,25 +76,23 @@ class LogWatcher(object):
             last_ts = self._group_timestamps.get(group_name, self._start_ts)
             end_ts = self._end_ts
 
+            filter_args = dict(
+                logGroupName=group_name,
+                logStreamNames=list(stream_names),
+                startTime=last_ts)
+            if end_ts:
+                filter_args['endTime'] = end_ts
+
+            logger.debug('Calling filter_log_events: {}'.format(
+                filter_args))
+
             try:
-                logger.debug('Calling filter_log_events: {}'.format(dict(
-                    logGroupName=group_name,
-                    logStreamNames=list(stream_names),
-                    startTime=last_ts,
-                    endTime=end_ts)))
-
-                event_batches = self._filter_log_events(
-                    logGroupName=group_name,
-                    logStreamNames=list(stream_names),
-                    startTime=last_ts,
-                    endTime=end_ts)
-
+                event_batches = self._filter_log_events(**filter_args)
                 for batch in event_batches:
                     for event in batch['events']:
                         yield self._event_time(event), group_name, event
                         last_ts = max(last_ts, event['ingestionTime'])
-            except botocore.exceptions.ClientError as e:
-                if e.response['Error']['Code'] != '404':
-                    raise
+            except self._client.exceptions.ResourceNotFoundException:
+                pass
 
             self._group_timestamps[group_name] = last_ts

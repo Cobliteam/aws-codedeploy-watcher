@@ -100,3 +100,7 @@ ENV/
 
 # Visual Studio Code
 .vscode/
+
+# IntelliJ
+.idea
+*.iml

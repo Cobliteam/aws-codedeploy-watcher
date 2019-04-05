@@ -1,0 +1,20 @@
+# Docker
+.dockerignore
+Dockerfile
+# Git
+.gitignore
+.git
+# Python
+**/__pycache__
+**/*.py?
+venv/
+.coverage*
+.cache
+build
+dist
+sdist
+*.egg-info
+# Editors
+.idea
+*.iml
+**/*.swp
